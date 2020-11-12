@@ -18,12 +18,14 @@ using System.Windows.Forms;
 using Newtonsoft.Json;
 using Input = ExileCore.Input;
 using nuVector2 = System.Numerics.Vector2;
+using ExileCore.Shared.Cache;
 
 namespace PickIt
 {
     public class PickIt : BaseSettingsPlugin<PickItSettings>
     {
         private const string PickitRuleDirectory = "Pickit Rules";
+        private TimeCache<List<CustomItem>> UpdateCacheList { get; set; }
         private readonly List<Entity> _entities = new List<Entity>();
         private readonly Stopwatch _pickUpTimer = Stopwatch.StartNew();
         private readonly Stopwatch DebugTimer = Stopwatch.StartNew();
@@ -43,7 +45,6 @@ namespace PickIt
         public DateTime buildDate;
         private uint coroutineCounter;
         private Vector2 cursorBeforePickIt;
-        private bool CustomRulesExists = true;
         private bool FullWork = true;
         private Element LastLabelClick;
         public string MagicRuleFile;
@@ -80,6 +81,7 @@ namespace PickIt
             Settings.MouseSpeed.OnValueChanged += (sender, f) => { Mouse.speedMouse = Settings.MouseSpeed.Value; };
             _workCoroutine = new WaitTime(Settings.ExtraDelay);
             Settings.ExtraDelay.OnValueChanged += (sender, i) => _workCoroutine = new WaitTime(i);
+            UpdateCacheList = new TimeCache<List<CustomItem>>(UpdateLabelComponent, 200);
             LoadRuleFiles();
             //LoadCustomItems();
             return true;
@@ -292,7 +294,7 @@ namespace PickIt
         public override Job Tick()
         {
             InventoryItems = GameController.Game.IngameState.ServerData.PlayerInventories[0].Inventory;
-            inventorySlots = Misc.GetInventoryArray(InventoryItems);
+            inventorySlots = Misc.GetContainer2DArray(InventoryItems);
             DrawIgnoredCellsSettings();
             if (Input.GetKeyState(Settings.LazyLootingPauseKey)) DisableLazyLootingTill = DateTime.Now.AddSeconds(2);
             if (Input.GetKeyState(Keys.Escape)) pickItCoroutine.Pause();
@@ -325,7 +327,7 @@ namespace PickIt
             if (DebugTimer.ElapsedMilliseconds > 300)
             {
                 FullWork = true;
-                LogMessage("Error pick it stop after time limit 300 ms", 1);
+                //LogMessage("Error pick it stop after time limit 300 ms", 1);
                 DebugTimer.Reset();
             }
             //Graphics.DrawText($@"PICKIT :: Debug Tick Timer ({DebugTimer.ElapsedMilliseconds}ms)", new Vector2(100, 100), FontAlign.Left);
@@ -354,7 +356,7 @@ namespace PickIt
                                   ImGuiWindowFlags.NoInputs |
                                   ImGuiWindowFlags.NoFocusOnAppearing | ImGuiWindowFlags.NoSavedSettings;
 
-            ImGui.SetNextWindowPos(Settings.InventorySlotsVector2, ImGuiCond.Once, nuVector2.Zero);
+            ImGui.SetNextWindowPos(Settings.InventorySlotsVector2, ImGuiCond.Always, nuVector2.Zero);
 
             if (ImGui.Begin($"{Name}", ref _opened,
                 Settings.MoveInventoryView.Value ? MoveableFlag : NonMoveableFlag))
@@ -371,7 +373,9 @@ namespace PickIt
                     _numb += 1;
                 }
 
-                Settings.InventorySlotsVector2 = ImGui.GetWindowPos();
+                if (Settings.MoveInventoryView.Value)
+                    Settings.InventorySlotsVector2 = ImGui.GetWindowPos();
+
                 ImGui.End();
             }
         }
@@ -596,8 +600,6 @@ namespace PickIt
 
             #region Rarity Rule Switch
 
-            if (CustomRulesExists)
-            {
                 switch (itemEntity.Rarity)
                 {
                     case ItemRarity.Normal:
@@ -633,7 +635,6 @@ namespace PickIt
 
                         break;
                 }
-            }
 
             #endregion
 
@@ -666,44 +667,27 @@ namespace PickIt
             }
         }
 
+        private List<CustomItem> UpdateLabelComponent() =>
+       GameController?.Game?.IngameState?.IngameUi?.ItemsOnGroundLabelsVisible.Where(x => x.Address != 0 &&
+                               x.ItemOnGround?.Path != null &&
+                               x.IsVisible &&
+                               x.CanPickUp && (x.MaxTimeForPickUp.TotalSeconds <= 0) || x.ItemOnGround?.Path == "Metadata/MiscellaneousObjects/Metamorphosis/MetamorphosisMonsterMarker")
+                   .Select(x => new CustomItem(x, GameController.Files,
+                       x.ItemOnGround.DistancePlayer, _weightsRules, x.ItemOnGround?.Path == "Metadata/MiscellaneousObjects/Metamorphosis/MetamorphosisMonsterMarker"))
+                   .OrderBy(x => x.Distance).ToList();
+
         private IEnumerator FindItemToPick()
         {
             if (!GameController.Window.IsForeground()) yield break;
+            if (UpdateCacheList.Value == null) yield break;
             var window = GameController.Window.GetWindowRectangleTimeCache;
             var rect = new RectangleF(window.X, window.X, window.X + window.Width, window.Y + window.Height);
             var playerPos = GameController.Player.GridPos;
 
-            List<CustomItem> currentLabels;
-            var morphPath = "Metadata/MiscellaneousObjects/Metamorphosis/MetamorphosisMonsterMarker";
-
-            if (Settings.UseWeight)
-            {
-                currentLabels = GameController.Game.IngameState.IngameUi.ItemsOnGroundLabelsVisible
-                    .Where(x => x.Address != 0 &&
-                                x.ItemOnGround?.Path != null &&
-                                x.IsVisible && x.Label.GetClientRectCache.Center.PointInRectangle(rect) &&
-                                x.CanPickUp && (x.MaxTimeForPickUp.TotalSeconds <= 0) || x.ItemOnGround?.Path == morphPath)
-                    .Select(x => new CustomItem(x, GameController.Files,
-                        x.ItemOnGround.DistancePlayer, _weightsRules, x.ItemOnGround?.Path == morphPath))
-                    .OrderByDescending(x => x.Weight).ThenBy(x => x.Distance).ToList();
-            }
-            else
-            {
-                //Linq query probably not performant enough for delirium amount of loots
-                currentLabels = GameController.Game.IngameState.IngameUi.ItemsOnGroundLabelsVisible
-                    .Where(x => x.Address != 0 &&
-                                x.ItemOnGround?.Path != null &&
-                                x.IsVisible && x.Label.GetClientRectCache.Center.PointInRectangle(rect) &&
-                                x.CanPickUp && (x.MaxTimeForPickUp.TotalSeconds <= 0) || x.ItemOnGround?.Path == morphPath)
-                    .Select(x => new CustomItem(x, GameController.Files,
-                        x.ItemOnGround.DistancePlayer, _weightsRules, x.ItemOnGround?.Path == morphPath))
-                    .OrderBy(x => x.Distance).ToList();
-            }
-
-            GameController.Debug["PickIt"] = currentLabels;
+            GameController.Debug["PickIt"] = UpdateCacheList?.Value;
             var rectangleOfGameWindow = GameController.Window.GetWindowRectangleTimeCache;
             rectangleOfGameWindow.Inflate(-36, -36);
-            var pickUpThisItem = currentLabels.FirstOrDefault(x =>
+            var pickUpThisItem = UpdateCacheList?.Value.FirstOrDefault(x =>
                 DoWePickThis(x) && x.Distance < Settings.PickupRange && x.GroundItem != null &&
                 rectangleOfGameWindow.Intersects(new RectangleF(x.LabelOnGround.Label.GetClientRectCache.Center.X,
                     x.LabelOnGround.Label.GetClientRectCache.Center.Y, 3, 3)) && Misc.CanFitInventory(x));
@@ -844,7 +828,6 @@ namespace PickIt
             if (!Directory.Exists(PickitConfigFileDirectory))
             {
                 Directory.CreateDirectory(PickitConfigFileDirectory);
-                CustomRulesExists = false;
                 return;
             }
 
@@ -865,7 +848,6 @@ namespace PickIt
 
             if (fileName == string.Empty)
             {
-                CustomRulesExists = false;
                 return hashSet;
             }
 
@@ -873,7 +855,6 @@ namespace PickIt
 
             if (!File.Exists(pickitFile))
             {
-                CustomRulesExists = false;
                 return hashSet;
             }
 
